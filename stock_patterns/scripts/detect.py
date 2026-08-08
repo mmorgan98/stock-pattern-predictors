@@ -1,132 +1,131 @@
-"""Detect patterns on a Yahoo Finance ticker (heuristic + optional trained model)."""
+"""Detect top patterns for a ticker inside a date/time window."""
 
 from __future__ import annotations
 
 import argparse
 import json
-from collections import Counter
 from pathlib import Path
 
-import numpy as np
+import pandas as pd
 
 from stock_patterns.data.yahoo_finance import fetch_ohlcv
 from stock_patterns.models.classifier import PatternClassifier
-from stock_patterns.patterns.registry import PATTERN_WINDOWS, detect_patterns
-from stock_patterns.pipeline.features import sequence_to_feature_vector
+from stock_patterns.patterns.registry import PATTERN_WINDOWS
+from stock_patterns.pipeline.ranking import rank_patterns, slice_date_window
 
 
-def _summarize_hits(hits: list[dict], recent: int = 10) -> dict:
-    counts = Counter(h["pattern"] for h in hits)
-    latest_by_pattern: dict[str, dict] = {}
-    for hit in hits:
-        prev = latest_by_pattern.get(hit["pattern"])
-        if prev is None or hit["end_date"] >= prev["end_date"]:
-            latest_by_pattern[hit["pattern"]] = hit
-    recent_hits = sorted(latest_by_pattern.values(), key=lambda h: h["end_date"], reverse=True)[:recent]
-    return {
-        "total_hits": len(hits),
-        "by_pattern": dict(counts.most_common()),
-        "latest_per_pattern": recent_hits,
-    }
-
-
-def _model_votes(model: PatternClassifier, df, step: int = 3, min_confidence: float = 0.35) -> list[dict]:
-    """
-    Score rolling windows across pattern window sizes.
-
-    Uses argmax votes only when confidence clears min_confidence, so unstructured
-    market segments do not all collapse into one long-window chart pattern.
-    """
-    class_names = model.class_names
-    if not class_names:
-        return []
-
-    name_to_idx = {n: i for i, n in enumerate(class_names)}
-    votes = np.zeros(len(class_names), dtype=float)
-    conf_sums = np.zeros(len(class_names), dtype=float)
-    n_confident = 0
-
-    windows = sorted({w for w in PATTERN_WINDOWS.values() if w > 0})
-    for window in windows:
-        if len(df) < window:
-            continue
-        for end in range(window, len(df) + 1, step):
-            window_df = df.iloc[end - window : end]
-            feats = sequence_to_feature_vector(window_df).reshape(1, -1)
-            proba = model.predict_proba(feats)[0]
-            top_idx = int(np.argmax(proba))
-            top_name = class_names[top_idx]
-            top_p = float(proba[top_idx])
-            if top_p < min_confidence:
-                continue
-            if top_name == "no_pattern":
-                continue
-            votes[top_idx] += 1.0
-            conf_sums[top_idx] += top_p
-            n_confident += 1
-
-    if n_confident == 0:
-        return []
-
-    ranked = sorted(
-        (
-            {
-                "pattern": class_names[i],
-                "window_votes": int(votes[i]),
-                "avg_confidence": float(conf_sums[i] / votes[i]) if votes[i] else 0.0,
-                "vote_share": float(votes[i] / n_confident),
-                "confident_windows": n_confident,
-            }
-            for i in range(len(class_names))
-            if votes[i] > 0 and class_names[i] != "no_pattern"
-        ),
-        key=lambda r: (r["window_votes"], r["avg_confidence"]),
-        reverse=True,
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Rank top candlestick/chart patterns in a date window"
     )
-    return ranked[:8]
+    parser.add_argument("--ticker", required=True, help="Symbol, e.g. AAPL")
+    parser.add_argument("--start", required=True, help="Window start date YYYY-MM-DD")
+    parser.add_argument("--end", required=True, help="Window end date YYYY-MM-DD")
+    parser.add_argument("--interval", default="1d", help="Bar interval, e.g. 1d, 1h")
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=5,
+        help="Number of top patterns to return (default: 5)",
+    )
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=Path("models/pattern_classifier.joblib"),
+        help="Trained model path (optional; omit or missing file = heuristics only)",
+    )
+    parser.add_argument(
+        "--step",
+        type=int,
+        default=1,
+        help="Rolling-window step for model scoring",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print a single JSON object instead of a short table",
+    )
+    return parser.parse_args()
+
+
+def _fetch_with_lookback(
+    ticker: str,
+    start: str,
+    end: str,
+    interval: str,
+) -> pd.DataFrame:
+    """Fetch OHLCV with enough pre-window bars for the largest pattern window."""
+    lookback_bars = max(PATTERN_WINDOWS.values())
+    start_ts = pd.Timestamp(start)
+    # Approximate calendar padding; daily uses business days, intraday uses hours.
+    if interval.endswith("d"):
+        padded_start = (start_ts - pd.Timedelta(days=lookback_bars * 3)).strftime("%Y-%m-%d")
+    else:
+        padded_start = (start_ts - pd.Timedelta(days=max(7, lookback_bars))).strftime("%Y-%m-%d")
+
+    # yfinance end is exclusive for daily; add one day so --end is inclusive.
+    end_exclusive = (pd.Timestamp(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    return fetch_ohlcv(
+        ticker=ticker,
+        interval=interval,
+        start=padded_start,
+        end=end_exclusive,
+    )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Detect candlestick / chart patterns")
-    parser.add_argument("--ticker", required=True)
-    parser.add_argument("--period", default="6mo")
-    parser.add_argument("--interval", default="1d")
-    parser.add_argument("--model", type=Path, default=None, help="Optional trained .joblib model")
-    parser.add_argument("--top", type=int, default=10, help="Latest unique patterns to print")
-    parser.add_argument("--model-step", type=int, default=3, help="Step size for rolling model windows")
-    parser.add_argument("--min-confidence", type=float, default=0.35, help="Min model confidence to count a vote")
-    args = parser.parse_args()
+    args = _parse_args()
+    if args.top < 1:
+        raise SystemExit("--top must be >= 1")
 
-    df = fetch_ohlcv(args.ticker, period=args.period, interval=args.interval)
-    hits = detect_patterns(df)
-    summary = _summarize_hits(hits, recent=args.top)
+    raw = _fetch_with_lookback(args.ticker, args.start, args.end, args.interval)
+    window_df = slice_date_window(raw, start=args.start, end=args.end)
+    if window_df.empty:
+        raise SystemExit(f"No bars found for {args.ticker.upper()} in {args.start}..{args.end}")
 
-    print(f"Heuristic hits for {args.ticker.upper()}: {summary['total_hits']}")
-    print("Counts by pattern:")
-    for pattern, count in summary["by_pattern"].items():
-        print(f"  {pattern}: {count}")
-    if not summary["by_pattern"]:
-        print("  (none)")
-
-    print("Latest hit per pattern:")
-    for hit in summary["latest_per_pattern"]:
-        print(json.dumps(hit))
-    if not summary["latest_per_pattern"]:
-        print("  (none)")
-
+    model = None
     if args.model and args.model.exists():
         model = PatternClassifier.load(args.model)
-        ranked = _model_votes(
-            model,
-            df,
-            step=max(1, args.model_step),
-            min_confidence=args.min_confidence,
+
+    ranked = rank_patterns(
+        window_df,
+        top=args.top,
+        model=model,
+        step=max(1, args.step),
+    )
+
+    payload = {
+        "ticker": args.ticker.upper(),
+        "start": args.start,
+        "end": args.end,
+        "interval": args.interval,
+        "bars": int(len(window_df)),
+        "model": str(args.model) if model is not None else None,
+        "top": ranked,
+    }
+
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return
+
+    print(
+        f"{payload['ticker']}  {payload['start']} -> {payload['end']}  "
+        f"({payload['bars']} bars)  top {args.top}"
+    )
+    if not ranked:
+        print("  (no patterns found)")
+        return
+    for i, row in enumerate(ranked, start=1):
+        print(
+            f"{i:>2}. {row['pattern']:<28} "
+            f"confidence={row['confidence']:.3f}  "
+            f"hits={row['heuristic_hits']}"
+            + (
+                f"  model_avg={row['model_avg_probability']:.3f}"
+                if row.get("model_avg_probability") is not None
+                else ""
+            )
         )
-        print("Model rolling-window ranking:")
-        for row in ranked:
-            print(json.dumps(row))
-        if not ranked:
-            print("  (no confident pattern votes)")
 
 
 if __name__ == "__main__":

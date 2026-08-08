@@ -58,11 +58,18 @@ Uses synthetic OHLC sequences by default (good for cold start). Optionally mix i
 python -m stock_patterns.scripts.train --samples 500 --out models/pattern_classifier.joblib
 ```
 
-## Detect patterns on a ticker
+## Detect top patterns in a date window
 
 ```bash
-python -m stock_patterns.scripts.detect --ticker AAPL --period 6mo
+python -m stock_patterns.scripts.detect \
+  --ticker AAPL \
+  --start 2026-01-01 \
+  --end 2026-03-31 \
+  --top 5 \
+  --model models/pattern_classifier.joblib
 ```
+
+Add `--json` for machine-readable output.
 
 ## Package layout
 
