@@ -67,6 +67,6 @@ def matches(df: pd.DataFrame) -> bool:
     left = lows[: n // 3].min()
     mid = lows[n // 3 : 2 * n // 3].min()
     right = lows[2 * n // 3 :].min()
-    shoulders_close = abs(left - right) / max(left, right) < 0.06
+    shoulders_close = abs(left - right) / max(left, right) < 0.08
     head_lowest = mid < left * 0.985 and mid < right * 0.985
     return bool(shoulders_close and head_lowest)
