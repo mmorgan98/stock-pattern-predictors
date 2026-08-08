@@ -14,11 +14,16 @@ def test_all_generators_self_match():
             df = gen(seed=seed)
             assert not df.empty, name
             assert {"open", "high", "low", "close"}.issubset(df.columns)
-            assert matcher(df), f"{name} failed self-match for seed={seed}"
+            if name == "no_pattern":
+                assert not matcher(df), "no_pattern must stay a negative class"
+            else:
+                assert matcher(df), f"{name} failed self-match for seed={seed}"
 
 
 def test_synthetic_dataset_shapes():
     X, y, names = build_synthetic_dataset(samples_per_pattern=5, seed=0)
     assert len(names) == len(PATTERN_NAMES)
-    assert X.shape[0] == len(PATTERN_NAMES) * 5
+    # no_pattern gets an extra batch of negative samples.
+    expected = len(PATTERN_NAMES) * 5 + 5
+    assert X.shape[0] == expected
     assert y.shape[0] == X.shape[0]

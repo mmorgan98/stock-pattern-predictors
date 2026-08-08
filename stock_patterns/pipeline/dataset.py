@@ -22,6 +22,15 @@ def build_synthetic_dataset(
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
     """Return (X, y, class_names) from random pattern generators."""
     generated = generate_all(samples_per_pattern=samples_per_pattern, seed=seed)
+    # Extra negative-class mass so real-market noise is not forced into a label.
+    no_pattern_extra = samples_per_pattern
+    if "no_pattern" in generated:
+        from stock_patterns.patterns.no_pattern import generate as gen_no_pattern
+
+        generated["no_pattern"].extend(
+            [gen_no_pattern(seed=seed + 500_000 + i) for i in range(no_pattern_extra)]
+        )
+
     xs: list[np.ndarray] = []
     ys: list[int] = []
     for label, name in enumerate(PATTERN_NAMES):

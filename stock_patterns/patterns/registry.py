@@ -21,6 +21,7 @@ from . import (
     inverse_head_and_shoulders,
     marubozu,
     morning_star,
+    no_pattern,
     piercing_line,
     shooting_star,
     spinning_top,
@@ -53,6 +54,7 @@ _MODULES: list[ModuleType] = [
     marubozu,
     tweezer,
     double_top_bottom,
+    no_pattern,
 ]
 
 PATTERN_GENERATORS: dict[str, Callable[..., pd.DataFrame]] = {

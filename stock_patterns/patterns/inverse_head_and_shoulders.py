@@ -63,10 +63,13 @@ def matches(df: pd.DataFrame) -> bool:
     if len(df) < WINDOW:
         return False
     lows = df["low"].iloc[-WINDOW:].to_numpy()
+    highs = df["high"].iloc[-WINDOW:].to_numpy()
     n = len(lows)
     left = lows[: n // 3].min()
     mid = lows[n // 3 : 2 * n // 3].min()
     right = lows[2 * n // 3 :].min()
-    shoulders_close = abs(left - right) / max(left, right) < 0.08
-    head_lowest = mid < left * 0.985 and mid < right * 0.985
-    return bool(shoulders_close and head_lowest)
+    neck = max(highs[: 2 * n // 3].max(), highs[n // 3 :].max())
+    shoulders_close = abs(left - right) / max(left, right) < 0.06
+    head_lowest = mid < left * 0.97 and mid < right * 0.97
+    bounced = neck > max(left, right) * 1.02
+    return bool(shoulders_close and head_lowest and bounced)

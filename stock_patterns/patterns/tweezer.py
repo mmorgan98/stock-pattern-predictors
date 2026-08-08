@@ -74,6 +74,13 @@ def matches(df: pd.DataFrame) -> bool:
     if len(df) < WINDOW:
         return False
     a, b = df.iloc[-2], df.iloc[-1]
-    high_match = abs(a["high"] - b["high"]) / max(a["high"], b["high"]) < 0.0025
-    low_match = abs(a["low"] - b["low"]) / max(a["low"], b["low"]) < 0.0025
-    return bool(high_match or low_match)
+    a_bull = a["close"] > a["open"]
+    b_bull = b["close"] > b["open"]
+    # Classic tweezer: opposite-colored candles sharing a high or low.
+    if a_bull == b_bull:
+        return False
+    high_match = abs(a["high"] - b["high"]) / max(a["high"], b["high"]) < 0.0015
+    low_match = abs(a["low"] - b["low"]) / max(a["low"], b["low"]) < 0.0015
+    tweezer_top = high_match and a_bull and (not b_bull)
+    tweezer_bottom = low_match and (not a_bull) and b_bull
+    return bool(tweezer_top or tweezer_bottom)
