@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
-from collections import Counter
+from collections import defaultdict
 
+import numpy as np
 import pandas as pd
 
+from stock_patterns.models.binary_ensemble import PatternEnsemble
 from stock_patterns.models.classifier import PatternClassifier
-from stock_patterns.patterns.registry import PATTERN_WINDOWS, detect_patterns
+from stock_patterns.patterns.registry import PATTERN_MATCHERS, PATTERN_WINDOWS, detect_patterns
 from stock_patterns.pipeline.features import sequence_to_feature_vector
 
 
@@ -30,96 +32,167 @@ def slice_date_window(
     return work
 
 
+def _heuristic_strengths(df: pd.DataFrame) -> dict[str, float]:
+    """
+    Pattern strength in [0, 1] from heuristic hit density and native-window match.
+    """
+    hits = detect_patterns(df)
+    counts: dict[str, int] = defaultdict(int)
+    for hit in hits:
+        counts[hit["pattern"]] += 1
+
+    strengths: dict[str, float] = {}
+    n = max(len(df), 1)
+    for name, matcher in PATTERN_MATCHERS.items():
+        if name == "no_pattern":
+            continue
+        window = PATTERN_WINDOWS[name]
+        trailing = 1.0 if len(df) >= window and matcher(df.iloc[-window:]) else 0.0
+        density = min(1.0, counts.get(name, 0) / max(n / max(window, 1), 1.0))
+        strengths[name] = float(min(1.0, 0.65 * trailing + 0.35 * density + (0.15 if counts.get(name, 0) else 0.0)))
+        if counts.get(name, 0) and strengths[name] < 0.2:
+            strengths[name] = 0.2
+    return strengths
+
+
+def _peak_scores_ensemble(
+    model: PatternEnsemble,
+    df: pd.DataFrame,
+    step: int = 1,
+    min_confidence: float = 0.45,
+) -> dict[str, dict]:
+    peaks: dict[str, list[float]] = defaultdict(list)
+    windows_scored = 0
+    window_sizes = sorted({PATTERN_WINDOWS[n] for n in model.pattern_names if n in PATTERN_WINDOWS})
+
+    for window in window_sizes:
+        if len(df) < window:
+            continue
+        for end in range(window, len(df) + 1, max(1, step)):
+            window_df = df.iloc[end - window : end]
+            # Prefer native window size for each pattern; also score with context.
+            feats = sequence_to_feature_vector(window_df).reshape(1, -1)
+            scores = model.score_vector(feats[0])
+            windows_scored += 1
+            for name, p in scores.items():
+                native = PATTERN_WINDOWS.get(name, window)
+                # Only accept scores near the pattern's native scale.
+                if abs(window - native) > 2 and window != max(window_sizes):
+                    continue
+                if p >= min_confidence:
+                    peaks[name].append(float(p))
+
+    out: dict[str, dict] = {}
+    for name, vals in peaks.items():
+        vals_sorted = sorted(vals, reverse=True)
+        topk = vals_sorted[: min(5, len(vals_sorted))]
+        out[name] = {
+            "peak_confidence": float(vals_sorted[0]),
+            "mean_peak_confidence": float(np.mean(topk)),
+            "peak_count": len(vals),
+            "windows_scored": windows_scored,
+        }
+    return out
+
+
+def _peak_scores_multiclass(
+    model: PatternClassifier,
+    df: pd.DataFrame,
+    step: int = 1,
+    min_confidence: float = 0.45,
+) -> dict[str, dict]:
+    class_names = [n for n in model.class_names if n != "no_pattern"]
+    peaks: dict[str, list[float]] = defaultdict(list)
+    windows_scored = 0
+    window_sizes = sorted({w for w in PATTERN_WINDOWS.values() if w > 0})
+
+    for window in window_sizes:
+        if len(df) < window:
+            continue
+        for end in range(window, len(df) + 1, max(1, step)):
+            window_df = df.iloc[end - window : end]
+            feats = sequence_to_feature_vector(window_df).reshape(1, -1)
+            proba = model.predict_proba(feats)[0]
+            windows_scored += 1
+            for name in class_names:
+                idx = model.class_names.index(name)
+                p = float(proba[idx])
+                if p >= min_confidence:
+                    peaks[name].append(p)
+
+    out: dict[str, dict] = {}
+    for name, vals in peaks.items():
+        vals_sorted = sorted(vals, reverse=True)
+        topk = vals_sorted[: min(5, len(vals_sorted))]
+        out[name] = {
+            "peak_confidence": float(vals_sorted[0]),
+            "mean_peak_confidence": float(np.mean(topk)),
+            "peak_count": len(vals),
+            "windows_scored": windows_scored,
+        }
+    return out
+
+
 def rank_patterns(
     df: pd.DataFrame,
     top: int = 5,
-    model: PatternClassifier | None = None,
+    model: PatternEnsemble | PatternClassifier | None = None,
     step: int = 1,
+    min_confidence: float = 0.45,
+    model_weight: float = 0.6,
+    heuristic_weight: float = 0.4,
 ) -> list[dict]:
     """
-    Rank the top patterns in a dataframe window.
+    Rank top patterns using peak-window model scores ensembled with heuristics.
 
-    When a model is available, confidence is that pattern's share of mean
-    class-probability mass (excluding `no_pattern`). Heuristic hit counts are
-    attached for context and used alone when no model is loaded.
+    confidence = model_weight * mean_top_peaks + heuristic_weight * heuristic_strength
     """
     if df is None or df.empty:
         return []
 
     work = df.copy()
     work.columns = [c.lower() for c in work.columns]
+    heur = _heuristic_strengths(work)
 
-    hits = detect_patterns(work)
-    hit_counts = Counter(h["pattern"] for h in hits)
-    total_hits = sum(hit_counts.values())
+    model_peaks: dict[str, dict] = {}
+    if isinstance(model, PatternEnsemble):
+        model_peaks = _peak_scores_ensemble(model, work, step=step, min_confidence=min_confidence)
+    elif isinstance(model, PatternClassifier):
+        model_peaks = _peak_scores_multiclass(model, work, step=step, min_confidence=min_confidence)
 
-    class_scores: dict[str, dict] = {}
+    names = sorted(set(heur) | set(model_peaks))
+    ranked_rows: list[dict] = []
+    mw = model_weight
+    hw = heuristic_weight
+    if model is None:
+        mw, hw = 0.0, 1.0
+    total_w = mw + hw
+    mw, hw = mw / total_w, hw / total_w
 
-    if model is not None and model.class_names:
-        class_names = [n for n in model.class_names if n != "no_pattern"]
-        proba_sums = {n: 0.0 for n in class_names}
-        proba_max = {n: 0.0 for n in class_names}
-        win_counts = {n: 0 for n in class_names}
-        windows_scored = 0
-
-        window_sizes = sorted({w for w in PATTERN_WINDOWS.values() if w > 0})
-        for window in window_sizes:
-            if len(work) < window:
-                continue
-            for end in range(window, len(work) + 1, max(1, step)):
-                window_df = work.iloc[end - window : end]
-                feats = sequence_to_feature_vector(window_df).reshape(1, -1)
-                proba = model.predict_proba(feats)[0]
-
-                best_name = None
-                best_p = -1.0
-                for name in class_names:
-                    idx = model.class_names.index(name)
-                    p = float(proba[idx])
-                    proba_sums[name] += p
-                    if p > proba_max[name]:
-                        proba_max[name] = p
-                    if p > best_p:
-                        best_p = p
-                        best_name = name
-                if best_name is not None:
-                    win_counts[best_name] += 1
-                windows_scored += 1
-
-        if windows_scored:
-            avg = {n: proba_sums[n] / windows_scored for n in class_names}
-            mass = sum(avg.values()) or 1.0
-            for name in class_names:
-                relative = avg[name] / mass
-                hits_n = int(hit_counts.get(name, 0))
-                class_scores[name] = {
-                    "pattern": name,
-                    "confidence": float(relative),
-                    "model_avg_probability": float(avg[name]),
-                    "model_max_probability": float(proba_max[name]),
-                    "model_window_wins": int(win_counts[name]),
-                    "heuristic_hits": hits_n,
-                    "windows_scored": windows_scored,
-                }
-    else:
-        for name, count in hit_counts.items():
-            class_scores[name] = {
+    for name in names:
+        h = float(heur.get(name, 0.0))
+        peak = model_peaks.get(name, {})
+        model_score = float(peak.get("mean_peak_confidence", 0.0))
+        # If model never cleared the peak threshold, fall back lightly to raw absence.
+        if name not in model_peaks and model is not None:
+            model_score = 0.0
+        confidence = mw * model_score + hw * h
+        if confidence <= 0:
+            continue
+        ranked_rows.append(
+            {
                 "pattern": name,
-                "confidence": float(count / total_hits) if total_hits else 0.0,
-                "model_avg_probability": None,
-                "model_max_probability": None,
-                "model_window_wins": 0,
-                "heuristic_hits": int(count),
-                "windows_scored": 0,
+                "confidence": float(confidence),
+                "model_peak_confidence": float(peak.get("peak_confidence", 0.0)),
+                "model_mean_peak_confidence": model_score,
+                "model_peak_count": int(peak.get("peak_count", 0)),
+                "heuristic_strength": h,
+                "windows_scored": int(peak.get("windows_scored", 0)),
             }
+        )
 
-    ranked = sorted(
-        class_scores.values(),
-        key=lambda r: (
-            r["confidence"],
-            r.get("model_window_wins", 0),
-            r["heuristic_hits"],
-        ),
+    ranked_rows.sort(
+        key=lambda r: (r["confidence"], r["model_peak_confidence"], r["heuristic_strength"]),
         reverse=True,
     )
-    return ranked[: max(1, top)]
+    return ranked_rows[: max(1, top)]

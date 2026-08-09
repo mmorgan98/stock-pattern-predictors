@@ -8,5 +8,6 @@ __pycache__/
 data/raw/
 data/synthetic/
 models/*.joblib
+models/*_patterns/
 .DS_Store
 *.log

@@ -1,4 +1,4 @@
-"""Sklearn RandomForest classifier for candlestick / chart patterns."""
+"""Calibrated multiclass booster (legacy/fallback path)."""
 
 from __future__ import annotations
 
@@ -6,29 +6,39 @@ from pathlib import Path
 
 import joblib
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import classification_report
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
+from stock_patterns.models.binary_ensemble import PatternEnsemble
+
 
 class PatternClassifier:
+    """Multiclass calibrated HistGradientBoosting classifier."""
+
     def __init__(self, class_names: list[str] | None = None, random_state: int = 42):
         self.class_names = class_names or []
         self.random_state = random_state
+        base = HistGradientBoostingClassifier(
+            max_depth=6,
+            learning_rate=0.08,
+            max_iter=200,
+            min_samples_leaf=10,
+            l2_regularization=0.1,
+            random_state=random_state,
+        )
         self.pipeline = Pipeline(
             steps=[
                 ("scaler", StandardScaler()),
                 (
                     "clf",
-                    RandomForestClassifier(
-                        n_estimators=200,
-                        max_depth=18,
-                        min_samples_leaf=2,
-                        n_jobs=-1,
-                        random_state=random_state,
-                        class_weight="balanced_subsample",
+                    CalibratedClassifierCV(
+                        estimator=base,
+                        method="sigmoid",
+                        cv=3,
                     ),
                 ),
             ]
@@ -69,7 +79,14 @@ class PatternClassifier:
     def save(self, path: str | Path) -> Path:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        joblib.dump({"pipeline": self.pipeline, "class_names": self.class_names}, path)
+        joblib.dump(
+            {
+                "pipeline": self.pipeline,
+                "class_names": self.class_names,
+                "kind": "pattern_multiclass_v2",
+            },
+            path,
+        )
         return path
 
     @classmethod
@@ -78,3 +95,13 @@ class PatternClassifier:
         obj = cls(class_names=blob.get("class_names", []))
         obj.pipeline = blob["pipeline"]
         return obj
+
+
+def load_any_model(path: str | Path) -> PatternEnsemble | PatternClassifier:
+    """Load either a PatternEnsemble index or a legacy/multiclass classifier."""
+    path = Path(path)
+    blob = joblib.load(path)
+    kind = blob.get("kind")
+    if kind == "pattern_ensemble_v1" or "pattern_files" in blob:
+        return PatternEnsemble.load(path)
+    return PatternClassifier.load(path)

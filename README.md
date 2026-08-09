@@ -1,6 +1,6 @@
 # Stock Pattern Predictors
 
-Synthetic candlestick-pattern generators plus a Yahoo Finance fetch pipeline for training pattern recognition models.
+Synthetic candlestick-pattern generators plus a Yahoo Finance fetch pipeline for training high-confidence pattern detectors.
 
 ## Patterns
 
@@ -29,6 +29,7 @@ Each pattern lives in its own file under `stock_patterns/patterns/` and exposes 
 | Marubozu | `marubozu.py` |
 | Tweezer Top / Bottom | `tweezer.py` |
 | Double Top / Bottom | `double_top_bottom.py` |
+| No Pattern (negatives) | `no_pattern.py` |
 
 ## Setup
 
@@ -36,6 +37,7 @@ Each pattern lives in its own file under `stock_patterns/patterns/` and exposes 
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pip install -e .
 ```
 
 ## Generate synthetic training data
@@ -50,13 +52,23 @@ python -m stock_patterns.scripts.generate_synthetic --samples 200 --out data/syn
 python -m stock_patterns.scripts.fetch_ticker --ticker AAPL --period 1y --interval 1d --out data/raw
 ```
 
-## Train a pattern classifier
+## Train high-confidence models
 
-Uses synthetic OHLC sequences by default (good for cold start). Optionally mix in labeled Yahoo bars later.
+Trains **one calibrated HistGradientBoosting binary detector per pattern**, using synthetic data plus weakly labeled Yahoo bars. Models are saved one file per pattern under `models/pattern_ensemble_patterns/`.
 
 ```bash
-python -m stock_patterns.scripts.train --samples 500 --out models/pattern_classifier.joblib
+python -m stock_patterns.scripts.train \
+  --samples 200 \
+  --tickers AAPL,MSFT,NVDA,AMZN,META,GOOGL,TSLA,JPM,XOM,SPY \
+  --out models/pattern_ensemble.joblib
 ```
+
+Confidence stack:
+- geometry-rich OHLC features
+- hard `no_pattern` negatives
+- binary-per-pattern calibrated boosters
+- Yahoo weak-label fine-tuning
+- peak-window scoring + model × heuristic ensemble at detect time
 
 ## Detect top patterns in a date window
 
@@ -66,7 +78,7 @@ python -m stock_patterns.scripts.detect \
   --start 2026-01-01 \
   --end 2026-03-31 \
   --top 5 \
-  --model models/pattern_classifier.joblib
+  --model models/pattern_ensemble.joblib
 ```
 
 Add `--json` for machine-readable output.
@@ -77,7 +89,7 @@ Add `--json` for machine-readable output.
 stock_patterns/
   patterns/          # one generator file per pattern
   data/              # Yahoo Finance client
-  pipeline/          # dataset assembly + feature extraction
-  models/            # sklearn classifier wrapper
+  pipeline/          # features, datasets, ranking
+  models/            # binary ensemble + multiclass fallback
   scripts/           # CLI entrypoints
 ```

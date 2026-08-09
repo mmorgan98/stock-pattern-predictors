@@ -21,9 +21,10 @@ def test_all_generators_self_match():
 
 
 def test_synthetic_dataset_shapes():
-    X, y, names = build_synthetic_dataset(samples_per_pattern=5, seed=0)
+    X, y, names = build_synthetic_dataset(samples_per_pattern=5, seed=0, no_pattern_multiplier=3)
     assert len(names) == len(PATTERN_NAMES)
-    # no_pattern gets an extra batch of negative samples.
-    expected = len(PATTERN_NAMES) * 5 + 5
+    # no_pattern gets (multiplier-1) extra batches beyond generate_all.
+    expected = len(PATTERN_NAMES) * 5 + 5 * (3 - 1)
     assert X.shape[0] == expected
     assert y.shape[0] == X.shape[0]
+    assert X.ndim == 2

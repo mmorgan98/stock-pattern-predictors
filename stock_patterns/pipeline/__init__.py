@@ -1,10 +1,11 @@
 """Dataset and feature pipelines."""
 
-from .dataset import build_synthetic_dataset, pad_sequence_features
+from .dataset import build_mixed_dataset, build_synthetic_dataset, pad_sequence_features
 from .features import sequence_to_feature_vector
 from .ranking import rank_patterns, slice_date_window
 
 __all__ = [
+    "build_mixed_dataset",
     "build_synthetic_dataset",
     "pad_sequence_features",
     "sequence_to_feature_vector",

@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from stock_patterns.data.yahoo_finance import fetch_ohlcv
-from stock_patterns.models.classifier import PatternClassifier
+from stock_patterns.models.classifier import load_any_model
 from stock_patterns.patterns.registry import PATTERN_WINDOWS
 from stock_patterns.pipeline.ranking import rank_patterns, slice_date_window
 
@@ -22,48 +22,33 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--start", required=True, help="Window start date YYYY-MM-DD")
     parser.add_argument("--end", required=True, help="Window end date YYYY-MM-DD")
     parser.add_argument("--interval", default="1d", help="Bar interval, e.g. 1d, 1h")
-    parser.add_argument(
-        "--top",
-        type=int,
-        default=5,
-        help="Number of top patterns to return (default: 5)",
-    )
+    parser.add_argument("--top", type=int, default=5, help="Top N patterns (default: 5)")
     parser.add_argument(
         "--model",
         type=Path,
-        default=Path("models/pattern_classifier.joblib"),
-        help="Trained model path (optional; omit or missing file = heuristics only)",
+        default=Path("models/pattern_ensemble.joblib"),
+        help="Ensemble index or multiclass .joblib (optional)",
     )
+    parser.add_argument("--step", type=int, default=1, help="Rolling-window step")
     parser.add_argument(
-        "--step",
-        type=int,
-        default=1,
-        help="Rolling-window step for model scoring",
+        "--min-confidence",
+        type=float,
+        default=0.45,
+        help="Min model probability for a window to count as a peak",
     )
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Print a single JSON object instead of a short table",
-    )
+    parser.add_argument("--model-weight", type=float, default=0.6)
+    parser.add_argument("--heuristic-weight", type=float, default=0.4)
+    parser.add_argument("--json", action="store_true", help="Print JSON object")
     return parser.parse_args()
 
 
-def _fetch_with_lookback(
-    ticker: str,
-    start: str,
-    end: str,
-    interval: str,
-) -> pd.DataFrame:
-    """Fetch OHLCV with enough pre-window bars for the largest pattern window."""
+def _fetch_with_lookback(ticker: str, start: str, end: str, interval: str) -> pd.DataFrame:
     lookback_bars = max(PATTERN_WINDOWS.values())
     start_ts = pd.Timestamp(start)
-    # Approximate calendar padding; daily uses business days, intraday uses hours.
     if interval.endswith("d"):
         padded_start = (start_ts - pd.Timedelta(days=lookback_bars * 3)).strftime("%Y-%m-%d")
     else:
         padded_start = (start_ts - pd.Timedelta(days=max(7, lookback_bars))).strftime("%Y-%m-%d")
-
-    # yfinance end is exclusive for daily; add one day so --end is inclusive.
     end_exclusive = (pd.Timestamp(end) + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     return fetch_ohlcv(
         ticker=ticker,
@@ -84,14 +69,21 @@ def main() -> None:
         raise SystemExit(f"No bars found for {args.ticker.upper()} in {args.start}..{args.end}")
 
     model = None
-    if args.model and args.model.exists():
-        model = PatternClassifier.load(args.model)
+    model_path = args.model
+    if model_path and model_path.exists():
+        model = load_any_model(model_path)
+    elif Path("models/pattern_classifier.joblib").exists():
+        model_path = Path("models/pattern_classifier.joblib")
+        model = load_any_model(model_path)
 
     ranked = rank_patterns(
         window_df,
         top=args.top,
         model=model,
         step=max(1, args.step),
+        min_confidence=args.min_confidence,
+        model_weight=args.model_weight,
+        heuristic_weight=args.heuristic_weight,
     )
 
     payload = {
@@ -100,7 +92,7 @@ def main() -> None:
         "end": args.end,
         "interval": args.interval,
         "bars": int(len(window_df)),
-        "model": str(args.model) if model is not None else None,
+        "model": str(model_path) if model is not None else None,
         "top": ranked,
     }
 
@@ -119,12 +111,9 @@ def main() -> None:
         print(
             f"{i:>2}. {row['pattern']:<28} "
             f"confidence={row['confidence']:.3f}  "
-            f"hits={row['heuristic_hits']}"
-            + (
-                f"  model_avg={row['model_avg_probability']:.3f}"
-                if row.get("model_avg_probability") is not None
-                else ""
-            )
+            f"model_peak={row['model_peak_confidence']:.3f}  "
+            f"heuristic={row['heuristic_strength']:.3f}  "
+            f"peaks={row['model_peak_count']}"
         )
 
 
